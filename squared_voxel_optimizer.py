@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SquaredVoxelOptimizer",
     "author": "Derikson",
-    "version": (1, 3, 0),
+    "version": (1, 5, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Sqrd Voxel Optimizer",
     "description": "Pipeline monolítico VOX -> Greedy Mesh -> Bake -> FBX. Otimizado para Bevy 0.18.",
@@ -13,6 +13,7 @@ import struct
 import zlib
 import math
 import os
+import mathutils
 from pathlib import Path
 from collections import defaultdict
 
@@ -90,11 +91,12 @@ def build_default_palette():
     return result
 
 class VoxObject:
-    def __init__(self, name, size, voxels, offset=(0,0,0)):
+    def __init__(self, name, size, voxels, transform=None, pivot=None):
         self.name   = name
         self.size   = size
         self.voxels = voxels
-        self.offset = offset
+        self.transform = transform
+        self.pivot = pivot
 
 class VoxScene:
     def __init__(self):
@@ -122,14 +124,6 @@ def _decode_rotation(r_byte):
     row1=[0,0,0]; row1[idx1]=s1
     row2=[0,0,0]; row2[idx2]=s2
     return [row0,row1,row2]
-
-def _apply_transform(rot, tx, ty, tz, vx, vy, vz, sx, sy, sz):
-    cx,cy,cz = sx//2, sy//2, sz//2
-    lx,ly,lz = vx-cx, vy-cy, vz-cz
-    rx = rot[0][0]*lx + rot[0][1]*ly + rot[0][2]*lz
-    ry = rot[1][0]*lx + rot[1][1]*ly + rot[1][2]*lz
-    rz = rot[2][0]*lx + rot[2][1]*ly + rot[2][2]*lz
-    return rx+tx, ry+ty, rz+tz
 
 def parse_vox_file(filepath):
     data = Path(filepath).read_bytes()
@@ -168,13 +162,21 @@ def parse_vox_file(filepath):
             layer_id = struct.unpack_from('<i', cdat, p)[0]; p += 4
             num_frames = struct.unpack_from('<i', cdat, p)[0]; p += 4
             frame, p = _read_dict(cdat, p)
+            
             tx=ty=tz=0
+            px=py=pz=None
+            
             if '_t' in frame:
                 parts=frame['_t'].split(); tx,ty,tz=int(parts[0]),int(parts[1]),int(parts[2])
+            
+            if '_p' in frame:
+                parts=frame['_p'].split(); px,py,pz=float(parts[0]),float(parts[1]),float(parts[2])
+                
             rot=[[1,0,0],[0,1,0],[0,0,1]]
             if '_r' in frame:
                 rot=_decode_rotation(int(frame['_r']))
-            nodes[node_id]={'type':'TRN','child':child_id, 'tx':tx,'ty':ty,'tz':tz,'rot':rot, 'name':attrs.get('_name','')}
+                
+            nodes[node_id]={'type':'TRN','child':child_id, 'tx':tx,'ty':ty,'tz':tz,'rot':rot, 'px':px, 'py':py, 'pz':pz, 'name':attrs.get('_name','')}
         elif cid == 'nGRP':
             p=0
             node_id=struct.unpack_from('<i', cdat, p)[0]; p+=4
@@ -206,7 +208,9 @@ def parse_vox_file(filepath):
         return scene
 
     obj_idx = [0]
-    def traverse(node_id, acc_rot, acc_tx, acc_ty, acc_tz):
+    
+    # Extrai as transformações isolando para o Motor do Blender
+    def traverse(node_id, acc_rot, acc_tx, acc_ty, acc_tz, current_pivot=None, trn_name=''):
         if node_id not in nodes: return
         node = nodes[node_id]
         if node['type'] == 'TRN':
@@ -214,31 +218,38 @@ def parse_vox_file(filepath):
             new_rot = [[sum(acc_rot[i][k]*lr[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
             lt = (node['tx'], node['ty'], node['tz'])
             rt = tuple(sum(acc_rot[i][k]*lt[k] for k in range(3)) for i in range(3))
-            traverse(node['child'], new_rot, acc_tx+rt[0], acc_ty+rt[1], acc_tz+rt[2])
+            
+            p_val = (node.get('px'), node.get('py'), node.get('pz'))
+            next_pivot = p_val if p_val[0] is not None else current_pivot
+            
+            # Mesmo metodo do add-on "MagicaVoxel VOX format": o nome do objeto
+            # vem do atributo _name do nTRN pai imediato do nSHP.
+            traverse(node['child'], new_rot, acc_tx+rt[0], acc_ty+rt[1], acc_tz+rt[2], next_pivot, node.get('name', ''))
+            
         elif node['type'] == 'GRP':
-            for child_id in node['children']: traverse(child_id, acc_rot, acc_tx, acc_ty, acc_tz)
+            for child_id in node['children']: traverse(child_id, acc_rot, acc_tx, acc_ty, acc_tz, current_pivot, trn_name)
+            
         elif node['type'] == 'SHP':
             mid = node['model_id']
             if mid >= len(raw_models): return
             m = raw_models[mid]
-            sx,sy,sz = m['size']
-            global_voxels = []
-            for vx,vy,vz,color in m['voxels']:
-                gx,gy,gz = _apply_transform(acc_rot, acc_tx,acc_ty,acc_tz, vx,vy,vz, sx,sy,sz)
-                global_voxels.append((gx,gy,gz,color))
-            if not global_voxels: return
-            ox = min(v[0] for v in global_voxels)
-            oy = min(v[1] for v in global_voxels)
-            oz = min(v[2] for v in global_voxels)
-            local_voxels = [(gx-ox, gy-oy, gz-oz, c) for gx,gy,gz,c in global_voxels]
-            lx_max = max(v[0] for v in local_voxels)
-            ly_max = max(v[1] for v in local_voxels)
-            lz_max = max(v[2] for v in local_voxels)
-            scene.objects.append(VoxObject(f'Object_{obj_idx[0]}', (lx_max+1, ly_max+1, lz_max+1), local_voxels, (ox,oy,oz)))
+            sx, sy, sz = m['size']
+
+            # Mesmo metodo do add-on "MagicaVoxel VOX format":
+            # a malha local e centralizada no pivot inteiro floor(size/2)
+            # e a transformacao acumulada (T @ R) e aplicada como matriz,
+            # sem correcoes de paridade/wobble.
+            scene.objects.append(VoxObject(
+                name=trn_name if trn_name else f'Object_{obj_idx[0]}',
+                size=(sx, sy, sz),
+                voxels=m['voxels'],
+                transform=(acc_rot, acc_tx, acc_ty, acc_tz),
+                pivot=(sx // 2, sy // 2, sz // 2)
+            ))
             obj_idx[0] += 1
 
     root_id  = min(n for n,v in nodes.items() if v['type']=='TRN')
-    traverse(root_id, [[1,0,0],[0,1,0],[0,0,1]], 0, 0, 0)
+    traverse(root_id, [[1,0,0],[0,1,0],[0,0,1]], 0, 0, 0, None)
     return scene
 
 # ==============================================================================
@@ -362,9 +373,11 @@ def _resolver_python(raw_quads):
         polygons = new_polygons
     return vertices, polygons
 
-def build_blender_geometry(vox_obj, voxel_size):
+def build_blender_geometry(vox_obj, voxel_size, palette):
     sides = ['xp', 'xn', 'yp', 'yn', 'zp', 'zn']
     raw_quads = []
+    
+    # Roda o algoritmo Mesher puramente no Espaço Local da Bounding Box (0 à sx)
     for side in sides:
         if BACKEND == 'c_ext':
             quads = getattr(_EXT, f"greedy_mesh_{side}")(vox_obj)
@@ -378,22 +391,58 @@ def build_blender_geometry(vox_obj, voxel_size):
     else:
         vertices, polygons = _resolver_python(raw_quads)
         
-    ox, oy, oz = vox_obj.offset
-    scaled_verts = [((lx+ox)*voxel_size, (ly+oy)*voxel_size, (lz+oz)*voxel_size) for lx,ly,lz in vertices]
+    rot, tx, ty, tz = vox_obj.transform
+    cx, cy, cz = vox_obj.pivot
+    
+    # Subtrai o Centro Verdadeiro (Pivot) da Geometria Local
+    scaled_verts = [((lx - cx) * voxel_size, (ly - cy) * voxel_size, (lz - cz) * voxel_size) for lx, ly, lz in vertices]
     faces = [[v-1 for v in p[0]] for p in polygons]
     
     mesh = bpy.data.meshes.new(vox_obj.name)
     mesh.from_pydata(scaled_verts, [], faces)
     
-    # Salva a cor original no próprio Mesh via atributo Face para o Baker ler
     color_attr = mesh.attributes.new(name="vox_color", type='INT', domain='FACE')
+    rgba_attr = mesh.attributes.new(name="Color", type='FLOAT_COLOR', domain='FACE')
+    
     for i, poly in enumerate(polygons):
-        color_attr.data[i].value = poly[2]
-        mesh.polygons[i].use_smooth = False # Hard edges
+        c_idx = poly[2]
+        color_attr.data[i].value = c_idx
+        
+        pal_idx = max(0, min(255, c_idx - 1))
+        r, g, b, a = palette[pal_idx]
+        rgba_attr.data[i].color = ((r/255.0)**2.2, (g/255.0)**2.2, (b/255.0)**2.2, 1.0)
+        
+        mesh.polygons[i].use_smooth = False
         
     mesh.update()
     obj = bpy.data.objects.new(vox_obj.name, mesh)
     bpy.context.collection.objects.link(obj)
+    
+    # Mesmo metodo do add-on "MagicaVoxel VOX format":
+    # matrix_world = Translation @ Rotation. A matriz e atribuida diretamente
+    # porque o byte _r do .vox pode codificar espelhamentos (det = -1),
+    # que rotation_euler nao consegue representar.
+    obj.matrix_world = mathutils.Matrix((
+        (rot[0][0], rot[0][1], rot[0][2], tx * voxel_size),
+        (rot[1][0], rot[1][1], rot[1][2], ty * voxel_size),
+        (rot[2][0], rot[2][1], rot[2][2], tz * voxel_size),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+    
+    mat = bpy.data.materials.new(name=f"{vox_obj.name}_Preview")
+    mat.use_nodes = True
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+    nodes.clear()
+    
+    attr_node = nodes.new("ShaderNodeAttribute")
+    attr_node.attribute_name = "Color"
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Roughness"].default_value = 1.0
+    out = nodes.new("ShaderNodeOutputMaterial")
+    
+    links.new(attr_node.outputs["Color"], bsdf.inputs["Base Color"])
+    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    obj.data.materials.append(mat)
     
     raw_faces_count = len(vox_obj.voxels) * 6
     opt_faces_count = len(polygons)
@@ -420,7 +469,6 @@ def execute_bake(obj, palette, resolution, output_dir):
     if "vox_color" not in mesh.attributes:
         return False, "Objeto não possui atributo 'vox_color'. Importe um .vox primeiro."
 
-    # Coleta cores usadas e constrói grid
     used_colors = sorted(set(attr.value for attr in mesh.attributes["vox_color"].data))
     n = len(used_colors)
     cols = math.ceil(math.sqrt(n))
@@ -450,7 +498,6 @@ def execute_bake(obj, palette, resolution, output_dir):
     png_path = os.path.join(output_dir, f"{obj.name}_baked.png")
     save_png(png_path, pixels, resolution, resolution)
 
-    # Criação e aplicação direta da UV
     uv_layer = mesh.uv_layers.new(name="UVMap_baked")
     mesh.uv_layers.active = uv_layer
     
@@ -460,7 +507,6 @@ def execute_bake(obj, palette, resolution, output_dir):
         for loop_idx in poly.loop_indices:
             uv_layer.data[loop_idx].uv = (u, v)
 
-    # Criação do Material (Flat shading preparado para Bevy)
     img = bpy.data.images.load(png_path)
     img.colorspace_settings.name = "sRGB"
     mat = bpy.data.materials.new(name=f"{obj.name}_Baked")
@@ -498,7 +544,6 @@ class VOX_OT_ShowReport(bpy.types.Operator):
         return {'FINISHED'}
 
     def invoke(self, context, event):
-        # Transforma o pop-up em um menu flutuante leve para remover os botões OK/Cancel indesejados
         return context.window_manager.invoke_popup(self, width=400)
 
     def draw(self, context):
@@ -530,7 +575,7 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
             total_opt = 0
             
             for vox_obj in scene.objects:
-                obj, raw_f, opt_f = build_blender_geometry(vox_obj, size)
+                obj, raw_f, opt_f = build_blender_geometry(vox_obj, size, scene.palette)
                 report_lines.append(f"{vox_obj.name}: {raw_f} -> {opt_f} faces")
                 total_raw += raw_f
                 total_opt += opt_f
@@ -543,7 +588,6 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
                 
             context.scene.vox_settings.last_report = report_str
             
-            # Só chama o pop-up se o checkbox estiver ativado
             if context.scene.vox_settings.show_optimization_report:
                 bpy.ops.vox.show_report('INVOKE_DEFAULT')
             
@@ -571,7 +615,9 @@ class VOX_OT_BakeOperator(bpy.types.Operator):
         palette = eval(settings.last_palette) if settings.last_palette else build_default_palette()
         out_dir = settings.last_import_dir if settings.save_in_vox_folder and settings.last_import_dir else bpy.path.abspath("//")
         
-        success, msg = execute_bake(obj, palette, settings.texture_resolution, out_dir)
+        res = int(settings.texture_resolution)
+        
+        success, msg = execute_bake(obj, palette, res, out_dir)
         self.report({'INFO'} if success else {'ERROR'}, msg)
         return {'FINISHED'}
 
@@ -596,7 +642,18 @@ class VOX_OT_ExportFBXOperator(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 class VoxelSettings(bpy.types.PropertyGroup):
-    texture_resolution: bpy.props.IntProperty(name="Texture Resolution", default=1024, min=64, max=4096)
+    texture_resolution: bpy.props.EnumProperty(
+        name="Texture Resolution",
+        description="Padrões POT (Power of 2) da Indústria",
+        items=[
+            ('128', "128x128", "Detalhes mínimos"),
+            ('256', "256x256", "Props pequenos"),
+            ('512', "512x512", "Padrão leve"),
+            ('1024', "1024x1024 (1K)", "Padrão recomendado"),
+            ('2048', "2048x2048 (2K)", "Máximo recomendado para Voxel"),
+        ],
+        default='1024'
+    )
     voxel_size: bpy.props.FloatProperty(name="Voxel Size", default=1.0, precision=2) 
     save_in_vox_folder: bpy.props.BoolProperty(name="Save in imported .vox folder", default=True)
     show_optimization_report: bpy.props.BoolProperty(name="Show Optimization Report", default=True)
