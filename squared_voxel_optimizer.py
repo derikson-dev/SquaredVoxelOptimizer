@@ -13,10 +13,70 @@ import struct
 import zlib
 import math
 import os
+import re
 import tempfile
 import mathutils
 from pathlib import Path
 from collections import defaultdict
+
+# ==============================================================================
+# DOMAIN 0: IDEMPOTENT IMPORT / NAMING HELPERS
+# ==============================================================================
+
+_NUMERIC_SUFFIX = re.compile(r"\.\d{3,}$")
+
+def _is_name_variant(name, base):
+    if name == base:
+        return True
+    return name.startswith(base) and bool(_NUMERIC_SUFFIX.match(name[len(base):]))
+
+def _free_name(id_collection, name):
+    existing = id_collection.get(name)
+    if existing is not None and existing.users == 0:
+        id_collection.remove(existing)
+
+def _base_part_name(name):
+    return _NUMERIC_SUFFIX.sub("", name)
+
+def _free_image(png_path):
+    target = os.path.normcase(os.path.abspath(png_path))
+    for img in list(bpy.data.images):
+        fp = img.filepath
+        if not fp:
+            continue
+        try:
+            resolved = os.path.normcase(os.path.abspath(bpy.path.abspath(fp)))
+        except Exception:
+            continue
+        if resolved == target:
+            img.user_clear() # Garante que soltou todas as referências
+            bpy.data.images.remove(img)
+
+def purge_previous_import(coll_name):
+    target_names = [c.name for c in bpy.data.collections
+                    if _is_name_variant(c.name, coll_name)]
+    meshes, materials = set(), set()
+    for cname in target_names:
+        coll = bpy.data.collections.get(cname)
+        if coll is None:
+            continue
+        for obj in list(coll.objects):
+            if obj.type == 'MESH' and obj.data is not None:
+                meshes.add(obj.data)
+                for slot in obj.material_slots:
+                    if slot.material is not None:
+                        materials.add(slot.material)
+            bpy.data.objects.remove(obj, do_unlink=True)
+    for me in list(meshes):
+        if me.users == 0:
+            bpy.data.meshes.remove(me)
+    for mat in list(materials):
+        if mat.users == 0:
+            bpy.data.materials.remove(mat)
+    for cname in target_names:
+        coll = bpy.data.collections.get(cname)
+        if coll is not None:
+            bpy.data.collections.remove(coll)
 
 # ==============================================================================
 # DOMAIN 1: C EXTENSIONS & FALLBACKS
@@ -210,7 +270,6 @@ def parse_vox_file(filepath):
 
     obj_idx = [0]
     
-    # Extract the transforms in Blender's coordinate space
     def traverse(node_id, acc_rot, acc_tx, acc_ty, acc_tz, current_pivot=None, trn_name=''):
         if node_id not in nodes: return
         node = nodes[node_id]
@@ -223,8 +282,6 @@ def parse_vox_file(filepath):
             p_val = (node.get('px'), node.get('py'), node.get('pz'))
             next_pivot = p_val if p_val[0] is not None else current_pivot
             
-            # Same approach as the "MagicaVoxel VOX format" add-on: the object
-            # name comes from the _name attribute of the nTRN directly above the nSHP.
             traverse(node['child'], new_rot, acc_tx+rt[0], acc_ty+rt[1], acc_tz+rt[2], next_pivot, node.get('name', ''))
             
         elif node['type'] == 'GRP':
@@ -236,10 +293,6 @@ def parse_vox_file(filepath):
             m = raw_models[mid]
             sx, sy, sz = m['size']
 
-            # Same approach as the "MagicaVoxel VOX format" add-on:
-            # the local mesh is centered on the integer pivot floor(size/2)
-            # and the accumulated transform (T @ R) is applied as a matrix,
-            # with no parity/wobble corrections.
             scene.objects.append(VoxObject(
                 name=trn_name if trn_name else f'Object_{obj_idx[0]}',
                 size=(sx, sy, sz),
@@ -378,7 +431,6 @@ def build_blender_geometry(vox_obj, voxel_size, palette, target_collection):
     sides = ['xp', 'xn', 'yp', 'yn', 'zp', 'zn']
     raw_quads = []
     
-    # Run the mesher purely in the bounding box local space (0 to sx)
     for side in sides:
         if BACKEND == 'c_ext':
             quads = getattr(_EXT, f"greedy_mesh_{side}")(vox_obj)
@@ -395,10 +447,10 @@ def build_blender_geometry(vox_obj, voxel_size, palette, target_collection):
     rot, tx, ty, tz = vox_obj.transform
     cx, cy, cz = vox_obj.pivot
     
-    # Subtract the true center (pivot) from the local geometry
     scaled_verts = [((lx - cx) * voxel_size, (ly - cy) * voxel_size, (lz - cz) * voxel_size) for lx, ly, lz in vertices]
     faces = [[v-1 for v in p[0]] for p in polygons]
     
+    _free_name(bpy.data.meshes, vox_obj.name)
     mesh = bpy.data.meshes.new(vox_obj.name)
     mesh.from_pydata(scaled_verts, [], faces)
     
@@ -416,13 +468,10 @@ def build_blender_geometry(vox_obj, voxel_size, palette, target_collection):
         mesh.polygons[i].use_smooth = False
         
     mesh.update()
+    _free_name(bpy.data.objects, vox_obj.name)
     obj = bpy.data.objects.new(vox_obj.name, mesh)
     target_collection.objects.link(obj)
     
-    # Same approach as the "MagicaVoxel VOX format" add-on:
-    # matrix_world = Translation @ Rotation. The matrix is assigned directly
-    # because the .vox _r byte can encode mirroring (det = -1),
-    # which rotation_euler cannot represent.
     obj.matrix_world = mathutils.Matrix((
         (rot[0][0], rot[0][1], rot[0][2], tx * voxel_size),
         (rot[1][0], rot[1][1], rot[1][2], ty * voxel_size),
@@ -430,16 +479,23 @@ def build_blender_geometry(vox_obj, voxel_size, palette, target_collection):
         (0.0, 0.0, 0.0, 1.0),
     ))
     
-    mat = bpy.data.materials.new(name=f"{vox_obj.name}_Preview")
+    mat_name = f"{vox_obj.name}_Preview"
+    _free_name(bpy.data.materials, mat_name)
+    mat = bpy.data.materials.new(name=mat_name)
     mat.use_nodes = True
     nodes, links = mat.node_tree.nodes, mat.node_tree.links
     nodes.clear()
     
     attr_node = nodes.new("ShaderNodeAttribute")
     attr_node.attribute_name = "Color"
+    attr_node.location = (-300, 0)
+    
     bsdf = nodes.new("ShaderNodeBsdfPrincipled")
     bsdf.inputs["Roughness"].default_value = 1.0
+    bsdf.location = (0, 0)
+    
     out = nodes.new("ShaderNodeOutputMaterial")
+    out.location = (300, 0)
     
     links.new(attr_node.outputs["Color"], bsdf.inputs["Base Color"])
     links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
@@ -496,7 +552,18 @@ def execute_bake(obj, palette, resolution, output_dir):
         v_c = 1.0 - (y0 + y1) / 2.0 / resolution
         color_to_uv[c_idx] = (u_c, v_c)
 
-    png_path = os.path.join(output_dir, f"{obj.name}_baked.png")
+    base_name = _base_part_name(obj.name)
+    png_path = os.path.join(output_dir, f"{base_name}_baked.png")
+    
+    _free_image(png_path)
+    
+    # Forçar a remoção do arquivo físico atualiza o timestamp no SO (Windows)
+    if os.path.exists(png_path):
+        try:
+            os.remove(png_path)
+        except OSError:
+            pass
+            
     try:
         save_png(png_path, pixels, resolution, resolution)
     except (PermissionError, OSError) as e:
@@ -504,7 +571,7 @@ def execute_bake(obj, palette, resolution, output_dir):
                        f"Save the .blend file in a writable folder (or enable "
                        f"'Save in imported .vox folder') and bake again. [{e}]")
 
-    uv_layer = mesh.uv_layers.new(name="UVMap_baked")
+    uv_layer = mesh.uv_layers.get("UVMap_baked") or mesh.uv_layers.new(name="UVMap_baked")
     mesh.uv_layers.active = uv_layer
     
     for poly in mesh.polygons:
@@ -515,26 +582,35 @@ def execute_bake(obj, palette, resolution, output_dir):
 
     img = bpy.data.images.load(png_path)
     img.colorspace_settings.name = "sRGB"
-    mat = bpy.data.materials.new(name=f"{obj.name}_Baked")
+    mat_name = f"{base_name}_Baked"
+    obj.data.materials.clear()
+    _free_name(bpy.data.materials, mat_name)
+    mat = bpy.data.materials.new(name=mat_name)
     mat.use_nodes = True
     nodes, links = mat.node_tree.nodes, mat.node_tree.links
     nodes.clear()
     
     uv_node = nodes.new("ShaderNodeUVMap")
     uv_node.uv_map = "UVMap_baked"
+    uv_node.location = (-600, 0)
+    
     tex_node = nodes.new("ShaderNodeTexImage")
     tex_node.image = img
     tex_node.interpolation = "Closest"
+    tex_node.location = (-300, 0)
+    
     bsdf = nodes.new("ShaderNodeBsdfPrincipled")
     bsdf.inputs["Metallic"].default_value = 0.0
     bsdf.inputs["Roughness"].default_value = 1.0
+    bsdf.location = (0, 0)
+    
     out = nodes.new("ShaderNodeOutputMaterial")
+    out.location = (300, 0)
     
     links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
     links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
     links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
     
-    obj.data.materials.clear()
     obj.data.materials.append(mat)
     
     return True, f"Bake finished and saved to {png_path}"
@@ -571,7 +647,6 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
 
     @staticmethod
     def _make_active_collection(context, collection):
-        # Set the given collection as the active one in the current view layer.
         def find(layer_coll):
             if layer_coll.collection == collection:
                 return layer_coll
@@ -588,7 +663,7 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
     def _recenter_to_floor(context, objects):
         if not objects:
             return
-        context.view_layer.update()  # ensure matrices/bounds are current
+        context.view_layer.update()
         mn = [float('inf')] * 3
         mx = [float('-inf')] * 3
         for obj in objects:
@@ -600,9 +675,9 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
         if mn[0] == float('inf'):
             return
         offset = mathutils.Vector((
-            -(mn[0] + mx[0]) / 2.0,   # center X
-            -(mn[1] + mx[1]) / 2.0,   # center Y
-            -mn[2],                   # base on the floor (Z = 0)
+            -(mn[0] + mx[0]) / 2.0,
+            -(mn[1] + mx[1]) / 2.0,
+            -mn[2],
         ))
         shift = mathutils.Matrix.Translation(offset)
         for obj in objects:
@@ -616,7 +691,6 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
             obj.select_set(True)
         if objects:
             context.view_layer.objects.active = objects[0]
-        # Frame the selection in the first available 3D viewport.
         for window in context.window_manager.windows:
             for area in window.screen.areas:
                 if area.type != 'VIEW_3D':
@@ -634,9 +708,9 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
             context.scene.vox_settings.last_palette = str(scene.palette)
             context.scene.vox_settings.last_import_dir = os.path.dirname(self.filepath)
 
-            # Group every imported object under a collection named after the .vox,
-            # so objects stay tidy and "Bake without selection" can target it.
             coll_name = os.path.splitext(os.path.basename(self.filepath))[0] or "VoxImport"
+            context.scene.vox_settings.last_import_name = coll_name
+            purge_previous_import(coll_name)
             vox_collection = bpy.data.collections.new(coll_name)
             context.scene.collection.children.link(vox_collection)
             self._make_active_collection(context, vox_collection)
@@ -653,11 +727,7 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
                 total_raw += raw_f
                 total_opt += opt_f
 
-            # Recenter the whole collection as a rigid block: centered on X/Y
-            # at the world origin, with its base resting on the floor (Z = 0).
             self._recenter_to_floor(context, created)
-
-            # Select the imported objects and frame them in the viewport.
             self._select_and_frame(context, created)
 
             report_str = f"Loaded objects: {len(scene.objects)}\n\n"
@@ -688,13 +758,10 @@ class VOX_OT_BakeOperator(bpy.types.Operator):
     directory: bpy.props.StringProperty(subtype="DIR_PATH", options={'HIDDEN'})
 
     def _gather_targets(self, context):
-        # 1) Explicitly selected meshes carrying the vox_color attribute.
         sel = [o for o in context.selected_objects
                if o.type == 'MESH' and "vox_color" in o.data.attributes]
         if sel:
             return sel
-        # 2) Otherwise, every vox mesh in the active collection
-        #    (but never the Scene Collection root — that just warns).
         coll = context.view_layer.active_layer_collection.collection
         if coll and coll != context.scene.collection:
             return [o for o in coll.all_objects
@@ -703,15 +770,11 @@ class VOX_OT_BakeOperator(bpy.types.Operator):
 
     def invoke(self, context, event):
         settings = context.scene.vox_settings
-        # Validate the selection first, so an empty/collection selection
-        # just warns instead of opening the folder picker.
         if not self._gather_targets(context):
             self.report({'WARNING'}, "Select imported objects, or activate the collection imported by the add-on.")
             return {'CANCELLED'}
-        # If the .vox folder is known and chosen, bake without asking.
         if settings.save_in_vox_folder and settings.last_import_dir:
             return self.execute(context)
-        # Otherwise prompt for an output folder.
         if bpy.data.filepath:
             self.directory = os.path.dirname(bpy.data.filepath)
         context.window_manager.fileselect_add(self)
@@ -724,8 +787,6 @@ class VOX_OT_BakeOperator(bpy.types.Operator):
             self.report({'WARNING'}, "Select imported objects, or activate the collection imported by the add-on.")
             return {'CANCELLED'}
 
-        # Resolve a writable output directory.
-        # Priority: imported .vox folder -> chosen folder -> .blend folder -> temp.
         if settings.save_in_vox_folder and settings.last_import_dir:
             out_dir = settings.last_import_dir
         elif self.directory:
@@ -756,18 +817,96 @@ class VOX_OT_ExportFBXOperator(bpy.types.Operator):
     bl_label = "Export FBX"
     filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="//export.fbx")
 
+    def _default_filepath(self, context):
+        settings = context.scene.vox_settings
+
+        # Nome base: prioriza a Collection ativa (clicada no Outliner). No fluxo normal
+        # de importação ela tem o mesmo nome do modelo .vox importado.
+        name = ""
+        try:
+            coll = context.view_layer.active_layer_collection.collection
+            if coll and coll != context.scene.collection:
+                name = _base_part_name(coll.name)
+        except Exception:
+            pass
+        if not name:
+            name = (getattr(settings, "last_import_name", "") or "").strip()
+        if not name and context.active_object:
+            name = _base_part_name(context.active_object.name)
+        if not name:
+            name = "export"
+
+        # Diretório padrão: pasta do .vox importado; senão, a pasta do .blend.
+        out_dir = ""
+        if settings.last_import_dir and os.path.isdir(settings.last_import_dir):
+            out_dir = settings.last_import_dir
+        elif bpy.data.filepath:
+            out_dir = os.path.dirname(bpy.data.filepath)
+
+        filename = name + ".fbx"
+        return os.path.join(out_dir, filename) if out_dir else filename
+
     def execute(self, context):
-        bpy.ops.export_scene.fbx(
+        # GARANTIA DO SUFIXO FBX
+        if not self.filepath.lower().endswith('.fbx'):
+            self.filepath += '.fbx'
+
+        fbx_kwargs = dict(
             filepath=self.filepath,
             use_selection=True,
             embed_textures=True,
             path_mode="COPY",
-            mesh_smooth_type="FACE"
+            mesh_smooth_type="FACE",
         )
+
+        if context.selected_objects:
+            # Comportamento padrão: exporta os objetos selecionados na Viewport.
+            bpy.ops.export_scene.fbx(**fbx_kwargs)
+        else:
+            # Sem seleção: exporta os objetos da Collection ativa (clicada no Outliner),
+            # como se eles estivessem selecionados.
+            coll = context.view_layer.active_layer_collection.collection
+            targets = list(coll.all_objects) if (coll and coll != context.scene.collection) else []
+            if not targets:
+                self.report({'WARNING'}, "Nenhum objeto para exportar. Selecione objetos na Viewport ou clique numa Collection no Outliner.")
+                return {'CANCELLED'}
+
+            view_layer = context.view_layer
+            prev_active = view_layer.objects.active
+            selected_any = False
+            for o in view_layer.objects:
+                o.select_set(False)
+            for o in targets:
+                try:
+                    o.select_set(True)
+                    view_layer.objects.active = o
+                    selected_any = True
+                except RuntimeError:
+                    pass  # objeto oculto / fora da view layer
+            if not selected_any:
+                self.report({'WARNING'}, "Os objetos da Collection não puderam ser selecionados (ocultos?).")
+                return {'CANCELLED'}
+            try:
+                bpy.ops.export_scene.fbx(**fbx_kwargs)
+            finally:
+                # Restaura o estado anterior (nada selecionado, como após clicar na Collection).
+                for o in view_layer.objects:
+                    o.select_set(False)
+                view_layer.objects.active = prev_active
+
         self.report({'INFO'}, "FBX exported successfully for the engine.")
         return {'FINISHED'}
         
     def invoke(self, context, event):
+        # VALIDAÇÃO: aceita objetos selecionados OU uma Collection ativa (clicada no Outliner)
+        if not context.selected_objects:
+            coll = context.view_layer.active_layer_collection.collection
+            has_coll_objs = bool(coll and coll != context.scene.collection and len(coll.all_objects) > 0)
+            if not has_coll_objs:
+                self.report({'WARNING'}, "Nenhum objeto selecionado nem Collection ativa com objetos. Selecione objetos na Viewport ou clique numa Collection no Outliner.")
+                return {'CANCELLED'}
+
+        self.filepath = self._default_filepath(context)
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -789,6 +928,7 @@ class VoxelSettings(bpy.types.PropertyGroup):
     show_optimization_report: bpy.props.BoolProperty(name="Show Optimization Report", default=True)
     last_palette: bpy.props.StringProperty()
     last_import_dir: bpy.props.StringProperty()
+    last_import_name: bpy.props.StringProperty()
     last_report: bpy.props.StringProperty()
 
 class VIEW3D_PT_VoxelPipelinePanel(bpy.types.Panel):
