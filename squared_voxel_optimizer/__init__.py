@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Squared Voxel Optimizer",
     "author": "Derikson",
-    "version": (1, 0, 0),
+    "version": (1, 4, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Squared VOR",
-    "description": "Monolithic VOX -> Greedy Mesh -> Bake -> FBX pipeline. Optimized for Bevy 0.18.",
+    "description": "Monolithic VOX -> Greedy Mesh -> Cull -> Bake (PBR/SSS/Glass) -> FBX. Optimized for Bevy 0.18.",
     "category": "Import-Export",
 }
 
@@ -14,6 +14,7 @@ import zlib
 import math
 import os
 import re
+import ast
 import tempfile
 import mathutils
 from pathlib import Path
@@ -49,7 +50,7 @@ def _free_image(png_path):
         except Exception:
             continue
         if resolved == target:
-            img.user_clear() # Garante que soltou todas as referências
+            img.user_clear()
             bpy.data.images.remove(img)
 
 def purge_previous_import(coll_name):
@@ -81,17 +82,28 @@ def purge_previous_import(coll_name):
 # ==============================================================================
 # DOMAIN 1: C EXTENSIONS & FALLBACKS
 # ==============================================================================
+# C extensions are bundled INSIDE this package (built by build_addon.py).
+# Try the package-relative import first; fall back to a loose .pyd on
+# sys.path (dev), then to the pure-Python implementation.
 try:
-    import greedy_mesher_ext as _EXT
+    from . import greedy_mesher_ext as _EXT
     BACKEND = 'c_ext'
 except ImportError:
-    BACKEND = 'python'
+    try:
+        import greedy_mesher_ext as _EXT
+        BACKEND = 'c_ext'
+    except ImportError:
+        BACKEND = 'python'
 
 try:
-    import tjunction_resolver as _TJ_C
+    from . import tjunction_resolver as _TJ_C
     _HAS_TJ_C = True
 except ImportError:
-    _HAS_TJ_C = False
+    try:
+        import tjunction_resolver as _TJ_C
+        _HAS_TJ_C = True
+    except ImportError:
+        _HAS_TJ_C = False
 
 # ==============================================================================
 # DOMAIN 2: VOX PARSING & STRUCTURES
@@ -163,6 +175,7 @@ class VoxScene:
     def __init__(self):
         self.objects = []
         self.palette = []
+        self.materials = {}
 
 def _read_dict(data, pos):
     n = struct.unpack_from('<i', data, pos)[0]; pos += 4
@@ -200,6 +213,7 @@ def parse_vox_file(filepath):
     raw_models = []
     nodes      = {}
     palette    = None
+    materials  = {}
 
     while pos < end:
         cid  = data[pos:pos+4].decode('ascii')
@@ -254,6 +268,11 @@ def parse_vox_file(filepath):
             nodes[node_id]={'type':'SHP','model_id':model_id}
         elif cid == 'RGBA':
             palette=[(cdat[i*4],cdat[i*4+1],cdat[i*4+2],cdat[i*4+3]) for i in range(256)]
+        elif cid == 'MATL':
+            mp = 0
+            mat_id = struct.unpack_from('<i', cdat, mp)[0]; mp += 4
+            props, mp = _read_dict(cdat, mp)
+            materials[mat_id] = props
         
         pos += 12 + csz
 
@@ -262,6 +281,7 @@ def parse_vox_file(filepath):
 
     scene = VoxScene()
     scene.palette = palette
+    scene.materials = materials
 
     if not nodes or not raw_models:
         for i, m in enumerate(raw_models):
@@ -521,7 +541,7 @@ def save_png(path, pixels, width, height):
     with open(path, 'wb') as f:
         f.write(png)
 
-def execute_bake(obj, palette, resolution, output_dir):
+def execute_bake(obj, palette, settings, output_dir, preserve_uvs=False):
     mesh = obj.data
     if "vox_color" not in mesh.attributes:
         return False, "Object has no 'vox_color' attribute. Import a .vox first."
@@ -530,10 +550,17 @@ def execute_bake(obj, palette, resolution, output_dir):
     n = len(used_colors)
     cols = math.ceil(math.sqrt(n))
     rows = math.ceil(n / cols)
-    tw = max(4, resolution // cols)
-    th = max(4, resolution // rows)
+    
+    if settings.upscale_mode == 'POT':
+        res_w = res_h = int(settings.texture_resolution)
+        tw = max(1, res_w // cols)
+        th = max(1, res_h // rows)
+    else:
+        tw = th = settings.pixel_scale_factor
+        res_w = cols * tw
+        res_h = rows * th
 
-    pixels = bytearray(resolution * resolution * 3)
+    pixels = bytearray(res_w * res_h * 3)
     color_to_uv = {}
 
     for fi, c_idx in enumerate(used_colors):
@@ -541,44 +568,40 @@ def execute_bake(obj, palette, resolution, output_dir):
         r, g, b = palette[pal_idx][:3]
         col, row = fi % cols, fi // cols
         x0, y0 = col * tw, row * th
-        x1, y1 = min(resolution, x0 + tw), min(resolution, y0 + th)
+        x1, y1 = min(res_w, x0 + tw), min(res_h, y0 + th)
 
-        for y in range(y0 + 1, y1 - 1):
-            for x in range(x0 + 1, x1 - 1):
-                idx = (y * resolution + x) * 3
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                idx = (y * res_w + x) * 3
                 pixels[idx], pixels[idx+1], pixels[idx+2] = r, g, b
 
-        u_c = (x0 + x1) / 2.0 / resolution
-        v_c = 1.0 - (y0 + y1) / 2.0 / resolution
+        u_c = (x0 + x1) / 2.0 / res_w
+        v_c = 1.0 - (y0 + y1) / 2.0 / res_h
         color_to_uv[c_idx] = (u_c, v_c)
 
     base_name = _base_part_name(obj.name)
     png_path = os.path.join(output_dir, f"{base_name}_baked.png")
     
     _free_image(png_path)
-    
-    # Forçar a remoção do arquivo físico atualiza o timestamp no SO (Windows)
     if os.path.exists(png_path):
-        try:
-            os.remove(png_path)
-        except OSError:
-            pass
+        try: os.remove(png_path)
+        except OSError: pass
             
     try:
-        save_png(png_path, pixels, resolution, resolution)
+        save_png(png_path, pixels, res_w, res_h)
     except (PermissionError, OSError) as e:
         return False, (f"Could not write the texture to '{png_path}'. "
                        f"Save the .blend file in a writable folder (or enable "
                        f"'Save in imported .vox folder') and bake again. [{e}]")
 
-    uv_layer = mesh.uv_layers.get("UVMap_baked") or mesh.uv_layers.new(name="UVMap_baked")
-    mesh.uv_layers.active = uv_layer
-    
-    for poly in mesh.polygons:
-        c_idx = mesh.attributes["vox_color"].data[poly.index].value
-        u, v = color_to_uv[c_idx]
-        for loop_idx in poly.loop_indices:
-            uv_layer.data[loop_idx].uv = (u, v)
+    if not (preserve_uvs and "UVMap_baked" in mesh.uv_layers):
+        uv_layer = mesh.uv_layers.get("UVMap_baked") or mesh.uv_layers.new(name="UVMap_baked")
+        mesh.uv_layers.active = uv_layer
+        for poly in mesh.polygons:
+            c_idx = mesh.attributes["vox_color"].data[poly.index].value
+            u, v = color_to_uv[c_idx]
+            for loop_idx in poly.loop_indices:
+                uv_layer.data[loop_idx].uv = (u, v)
 
     img = bpy.data.images.load(png_path)
     img.colorspace_settings.name = "sRGB"
@@ -615,29 +638,400 @@ def execute_bake(obj, palette, resolution, output_dir):
     
     return True, f"Bake finished and saved to {png_path}"
 
+def _shared_atlas_targets(context, targets):
+    scene_coll = context.scene.collection
+    colls = set()
+    for o in targets:
+        for c in o.users_collection:
+            if c is not scene_coll:
+                colls.add(c)
+    if not colls:
+        return targets
+    out, seen = [], set()
+    for c in colls:
+        for o in c.all_objects:
+            if (o.type == "MESH" and o.data is not None
+                    and "vox_color" in o.data.attributes
+                    and o.name not in seen):
+                seen.add(o.name)
+                out.append(o)
+    return out or targets
+
+def _vox_emission(props, base_rgb):
+    if not props: return 0, 0, 0, 0.0, False
+    mtype = props.get("_type", "")
+    try: emit = float(props.get("_emit", 0) or 0)
+    except (TypeError, ValueError): emit = 0.0
+    try: flux = float(props.get("_flux", 0) or 0)
+    except (TypeError, ValueError): flux = 0.0
+    if not (mtype == "_emit" or emit > 0.0):
+        return 0, 0, 0, 0.0, False
+    er = max(0, min(255, int(round(base_rgb[0] * emit))))
+    eg = max(0, min(255, int(round(base_rgb[1] * emit))))
+    eb = max(0, min(255, int(round(base_rgb[2] * emit))))
+    return er, eg, eb, flux, True
+
+def _vox_rough_metal(props):
+    rough, metal = 1.0, 0.0
+    if props:
+        try: rough = float(props.get("_rough", 1.0))
+        except (TypeError, ValueError): rough = 1.0
+        try: metal = float(props.get("_metal", 0.0))
+        except (TypeError, ValueError): metal = 0.0
+    return max(0.0, min(1.0, rough)), max(0.0, min(1.0, metal))
+
+def _vox_transmission(props):
+    trans, ior = 0.0, 1.45
+    if props and props.get("_type", "") == "_glass":
+        # The glass transparency key is version-dependent in MagicaVoxel;
+        # '_alpha'/'_trans' usually hold it, with '_weight' as a last resort.
+        # Read whichever is present (semantics approximate -- verify with a
+        # real glass .vox; '_alpha' may mean opacity on some versions).
+        trans = 1.0
+        for key in ("_alpha", "_trans", "_weight"):
+            if key in props:
+                try:
+                    trans = float(props.get(key) or 0.0)
+                except (TypeError, ValueError):
+                    trans = 1.0
+                break
+        try:
+            ior = float(props.get("_ior", 1.45))
+        except (TypeError, ValueError):
+            ior = 1.45
+    return max(0.0, min(1.0, trans)), max(1.0, ior)
+
+def _vox_subsurface(props):
+    # MagicaVoxel has no standard subsurface key. Only honor an explicit
+    # '_ss' if it exists; do NOT fall back to '_sp' -- that is specular,
+    # and feeding it to subsurface gives glossy materials bogus SSS.
+    sss = 0.0
+    if props:
+        try:
+            sss = float(props.get("_ss", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            sss = 0.0
+    return max(0.0, min(1.0, sss))
+
+def get_overridden_material(settings, c_idx, default_props, base_rgb):
+    for item in settings.materials_list:
+        if item.color_idx == c_idx:
+            emissive = item.emission > 0.0
+            er = max(0, min(255, int(round(base_rgb[0] * min(item.emission, 1.0)))))
+            eg = max(0, min(255, int(round(base_rgb[1] * min(item.emission, 1.0)))))
+            eb = max(0, min(255, int(round(base_rgb[2] * min(item.emission, 1.0)))))
+            return (item.roughness, item.metallic, item.transmission, 
+                    item.ior, item.sss, er, eg, eb, item.emission, emissive)
+    
+    rough, metal = _vox_rough_metal(default_props)
+    trans, ior = _vox_transmission(default_props)
+    sss = _vox_subsurface(default_props)
+    er, eg, eb, flux, emissive = _vox_emission(default_props, base_rgb)
+    return rough, metal, trans, ior, sss, er, eg, eb, flux, emissive
+
+def bake_shared_atlas(objects, palette, settings, output_dir, atlas_name, materials=None, preserve_uvs=False):
+    mats = materials or {}
+    targets = [o for o in objects
+               if o.type == "MESH" and o.data is not None
+               and "vox_color" in o.data.attributes]
+    if not targets:
+        return False, "No bake-ready meshes (missing 'vox_color'). Import a .vox first."
+
+    color_set = set()
+    for obj in targets:
+        for attr in obj.data.attributes["vox_color"].data:
+            color_set.add(attr.value)
+    used_colors = sorted(color_set)
+    if not used_colors:
+        return False, "No colors found to bake."
+
+    n = len(used_colors)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    
+    if settings.upscale_mode == 'POT':
+        res_w = res_h = int(settings.texture_resolution)
+        tw = max(1, res_w // cols)
+        th = max(1, res_h // rows)
+    else:
+        tw = th = settings.pixel_scale_factor
+        res_w = cols * tw
+        res_h = rows * th
+
+    pixels = bytearray(res_w * res_h * 3)
+    emit_pixels = bytearray(res_w * res_h * 3)
+    rough_pixels = bytearray(res_w * res_h * 3)
+    metal_pixels = bytearray(res_w * res_h * 3)
+    trans_pixels = bytearray(res_w * res_h * 3)
+    sss_pixels = bytearray(res_w * res_h * 3)
+    
+    has_emission = False
+    max_flux = 0.0
+    rough_values, metal_values, trans_values, ior_values, sss_values = set(), set(), set(), set(), set()
+    color_to_uv = {}
+    
+    for fi, c_idx in enumerate(used_colors):
+        pal_idx = max(0, min(255, c_idx - 1))
+        r, g, b = palette[pal_idx][:3]
+        props = mats.get(c_idx)
+        
+        rough, metal, trans, ior, sss, er, eg, eb, flux, emissive = get_overridden_material(settings, c_idx, props, (r, g, b))
+
+        if emissive:
+            has_emission = True
+            max_flux = max(max_flux, flux)
+            
+        rough_values.add(round(rough, 4))
+        metal_values.add(round(metal, 4))
+        trans_values.add(round(trans, 4))
+        sss_values.add(round(sss, 4))
+        if trans > 0.0: ior_values.add(round(ior, 4))
+        
+        rg = max(0, min(255, int(round(rough * 255))))
+        mg = max(0, min(255, int(round(metal * 255))))
+        tg = max(0, min(255, int(round(trans * 255))))
+        sg = max(0, min(255, int(round(sss * 255))))
+        
+        col, row = fi % cols, fi // cols
+        x0, y0 = col * tw, row * th
+        x1, y1 = min(res_w, x0 + tw), min(res_h, y0 + th)
+        
+        for y in range(y0, y1):
+            row_off = y * res_w
+            for x in range(x0, x1):
+                idx = (row_off + x) * 3
+                pixels[idx], pixels[idx + 1], pixels[idx + 2] = r, g, b
+                emit_pixels[idx], emit_pixels[idx + 1], emit_pixels[idx + 2] = er, eg, eb
+                rough_pixels[idx] = rough_pixels[idx + 1] = rough_pixels[idx + 2] = rg
+                metal_pixels[idx] = metal_pixels[idx + 1] = metal_pixels[idx + 2] = mg
+                trans_pixels[idx] = trans_pixels[idx + 1] = trans_pixels[idx + 2] = tg
+                sss_pixels[idx] = sss_pixels[idx + 1] = sss_pixels[idx + 2] = sg
+                
+        u_c = (x0 + x1) / 2.0 / res_w
+        v_c = 1.0 - (y0 + y1) / 2.0 / res_h
+        color_to_uv[c_idx] = (u_c, v_c)
+
+    safe = _base_part_name(atlas_name) or "Character"
+
+    png_path = os.path.join(output_dir, f"{safe}_atlas.png")
+    _free_image(png_path)
+    if os.path.exists(png_path):
+        try: os.remove(png_path)
+        except OSError: pass
+    try:
+        save_png(png_path, pixels, res_w, res_h)
+    except (PermissionError, OSError) as e:
+        return False, (f"Could not write the atlas to '{png_path}'. [{e}]")
+
+    def _write_data_map(suffix, buf, do_write, non_color, w, h):
+        p = os.path.join(output_dir, f"{safe}_{suffix}.png")
+        _free_image(p)
+        if os.path.exists(p):
+            try: os.remove(p)
+            except OSError: pass
+        if not do_write:
+            return None
+        try: save_png(p, buf, w, h)
+        except (PermissionError, OSError): return None
+        im = bpy.data.images.load(p)
+        im.colorspace_settings.name = "Non-Color" if non_color else "sRGB"
+        return im
+
+    emit_img = _write_data_map("emit", emit_pixels, has_emission, non_color=False, w=res_w, h=res_h)
+    rough_img = _write_data_map("rough", rough_pixels, len(rough_values) > 1, non_color=True, w=res_w, h=res_h)
+    metal_img = _write_data_map("metal", metal_pixels, len(metal_values) > 1, non_color=True, w=res_w, h=res_h)
+    trans_img = _write_data_map("trans", trans_pixels, len(trans_values) > 1, non_color=True, w=res_w, h=res_h)
+    sss_img = _write_data_map("sss", sss_pixels, len(sss_values) > 1, non_color=True, w=res_w, h=res_h)
+    
+    rough_const = next(iter(rough_values)) if rough_values else 1.0
+    metal_const = next(iter(metal_values)) if metal_values else 0.0
+    trans_const = next(iter(trans_values)) if trans_values else 0.0
+    ior_const = next(iter(ior_values)) if ior_values else 1.45
+    sss_const = next(iter(sss_values)) if sss_values else 0.0
+
+    for obj in targets:
+        mesh = obj.data
+        if preserve_uvs and "UVMap_baked" in mesh.uv_layers:
+            mesh.materials.clear()
+            continue
+            
+        uv_layer = mesh.uv_layers.get("UVMap_baked") or mesh.uv_layers.new(name="UVMap_baked")
+        mesh.uv_layers.active = uv_layer
+        vox = mesh.attributes["vox_color"].data
+        for poly in mesh.polygons:
+            u, v = color_to_uv[vox[poly.index].value]
+            for loop_idx in poly.loop_indices:
+                uv_layer.data[loop_idx].uv = (u, v)
+        mesh.materials.clear()
+
+    img = bpy.data.images.load(png_path)
+    img.colorspace_settings.name = "sRGB"
+    mat_name = f"{safe}_Atlas"
+    mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
+    mat.use_nodes = True
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+    nodes.clear()
+
+    uv_node = nodes.new("ShaderNodeUVMap")
+    uv_node.uv_map = "UVMap_baked"
+    uv_node.location = (-600, 0)
+
+    tex_node = nodes.new("ShaderNodeTexImage")
+    tex_node.image = img
+    tex_node.interpolation = "Closest"
+    tex_node.location = (-300, 0)
+
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (0, 0)
+
+    out = nodes.new("ShaderNodeOutputMaterial")
+    out.location = (300, 0)
+
+    links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
+    links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+    if emit_img is not None:
+        emit_tex = nodes.new("ShaderNodeTexImage")
+        emit_tex.image = emit_img
+        emit_tex.interpolation = "Closest"
+        emit_tex.location = (-300, -320)
+        links.new(uv_node.outputs["UV"], emit_tex.inputs["Vector"])
+        emis_in = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
+        if emis_in is not None:
+            links.new(emit_tex.outputs["Color"], emis_in)
+        strength_in = bsdf.inputs.get("Emission Strength")
+        if strength_in is not None:
+            strength_in.default_value = 1.0 + max_flux
+
+    if rough_img is not None:
+        r_tex = nodes.new("ShaderNodeTexImage")
+        r_tex.image = rough_img
+        r_tex.interpolation = "Closest"
+        r_tex.location = (-300, -640)
+        links.new(uv_node.outputs["UV"], r_tex.inputs["Vector"])
+        links.new(r_tex.outputs["Color"], bsdf.inputs["Roughness"])
+    else:
+        bsdf.inputs["Roughness"].default_value = rough_const
+
+    if metal_img is not None:
+        m_tex = nodes.new("ShaderNodeTexImage")
+        m_tex.image = metal_img
+        m_tex.interpolation = "Closest"
+        m_tex.location = (-300, -960)
+        links.new(uv_node.outputs["UV"], m_tex.inputs["Vector"])
+        links.new(m_tex.outputs["Color"], bsdf.inputs["Metallic"])
+    else:
+        bsdf.inputs["Metallic"].default_value = metal_const
+
+    trans_in = bsdf.inputs.get("Transmission Weight") or bsdf.inputs.get("Transmission")
+    if trans_in is not None:
+        if trans_img is not None:
+            t_tex = nodes.new("ShaderNodeTexImage")
+            t_tex.image = trans_img
+            t_tex.interpolation = "Closest"
+            t_tex.location = (-300, -1280)
+            links.new(uv_node.outputs["UV"], t_tex.inputs["Vector"])
+            links.new(t_tex.outputs["Color"], trans_in)
+        else:
+            trans_in.default_value = trans_const
+            
+    ior_in = bsdf.inputs.get("IOR")
+    if ior_in is not None:
+        ior_in.default_value = ior_const
+
+    sss_in = bsdf.inputs.get("Subsurface Weight") or bsdf.inputs.get("Subsurface")
+    if sss_in is not None:
+        if sss_img is not None:
+            s_tex = nodes.new("ShaderNodeTexImage")
+            s_tex.image = sss_img
+            s_tex.interpolation = "Closest"
+            s_tex.location = (-300, -1600)
+            links.new(uv_node.outputs["UV"], s_tex.inputs["Vector"])
+            links.new(s_tex.outputs["Color"], sss_in)
+        else:
+            sss_in.default_value = sss_const
+
+    for obj in targets:
+        obj.data.materials.append(mat)
+
+    extras = []
+    if emit_img is not None: extras.append("emission")
+    if rough_img is not None: extras.append("roughness")
+    if metal_img is not None: extras.append("metallic")
+    if trans_img is not None: extras.append("transmission")
+    if sss_img is not None: extras.append("subsurface")
+        
+    extra = (" (+" + ", ".join(extras) + ")") if extras else ""
+    return True, f"Shared atlas baked for {len(targets)} part(s){extra}: {png_path}"
+
 # ==============================================================================
-# DOMAIN 5: UI PANEL & OPERATORS
+# DOMAIN 5: GEOMETRY OPERATIONS (CULLING)
 # ==============================================================================
+def execute_boolean_culling(context, targets):
+    if len(targets) < 2: return False, "Select at least 2 objects to cull internal faces."
+    if context.active_object and context.active_object.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+
+    base_obj = targets[0]
+    others = targets[1:]
+    faces_before = sum(len(o.data.polygons) for o in targets)
+
+    temp_coll = bpy.data.collections.new("VoxTempBool")
+    context.scene.collection.children.link(temp_coll)
+    for obj in others: temp_coll.objects.link(obj)
+
+    mod = base_obj.modifiers.new(name="VoxCulling", type='BOOLEAN')
+    mod.operation = 'UNION'
+    mod.operand_type = 'COLLECTION'
+    mod.collection = temp_coll
+    mod.solver = 'EXACT'
+
+    context.view_layer.objects.active = base_obj
+    for obj in context.view_layer.objects: obj.select_set(False)
+    base_obj.select_set(True)
+
+    try: bpy.ops.object.modifier_apply(modifier=mod.name)
+    except Exception as e:
+        bpy.data.collections.remove(temp_coll)
+        return False, f"Failed to execute Boolean Culling: {e}"
+
+    faces_after = len(base_obj.data.polygons)
+    for obj in others: bpy.data.objects.remove(obj, do_unlink=True)
+    bpy.data.collections.remove(temp_coll)
+    reduction = 100 - (faces_after / faces_before * 100) if faces_before > 0 else 0
+
+    return True, f"Culling complete! From {faces_before} to {faces_after} faces (-{reduction:.1f}%)."
+
+# ==============================================================================
+# DOMAIN 6: UI PANEL & OPERATORS
+# ==============================================================================
+class VoxMaterialItem(bpy.types.PropertyGroup):
+    color_idx: bpy.props.IntProperty()
+    preview_color: bpy.props.FloatVectorProperty(subtype='COLOR', size=4)
+    roughness: bpy.props.FloatProperty(name="Roughness", default=1.0, min=0.0, max=1.0)
+    metallic: bpy.props.FloatProperty(name="Metallic", default=0.0, min=0.0, max=1.0)
+    emission: bpy.props.FloatProperty(name="Emission", default=0.0, min=0.0)
+    transmission: bpy.props.FloatProperty(name="Transmission", default=0.0, min=0.0, max=1.0)
+    ior: bpy.props.FloatProperty(name="IOR", default=1.45, min=1.0, max=3.0)
+    sss: bpy.props.FloatProperty(name="Subsurface", default=0.0, min=0.0, max=1.0)
+
+class VOX_UL_MaterialList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        layout.prop(item, "preview_color", text=f"Color {item.color_idx}", toggle=True)
+
 class VOX_OT_ShowReport(bpy.types.Operator):
     bl_idname = "vox.show_report"
     bl_label = "Optimization Report"
 
-    def execute(self, context):
-        return {'FINISHED'}
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_popup(self, width=400)
-
+    def execute(self, context): return {'FINISHED'}
+    def invoke(self, context, event): return context.window_manager.invoke_popup(self, width=400)
     def draw(self, context):
         layout = self.layout
         report = context.scene.vox_settings.last_report
         for line in report.split('\n'):
-            if line.startswith("Total:") or line.startswith("Geometry reduction"):
-                layout.label(text=line, icon='INFO')
-            elif line.strip() == "":
-                layout.separator()
-            else:
-                layout.label(text=line)
+            if line.startswith("Total:") or line.startswith("Geometry reduction"): layout.label(text=line, icon='INFO')
+            elif line.strip() == "": layout.separator()
+            else: layout.label(text=line)
 
 class VOX_OT_ImportOperator(bpy.types.Operator):
     bl_idname = "vox.import"
@@ -648,21 +1042,17 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
     @staticmethod
     def _make_active_collection(context, collection):
         def find(layer_coll):
-            if layer_coll.collection == collection:
-                return layer_coll
+            if layer_coll.collection == collection: return layer_coll
             for child in layer_coll.children:
                 found = find(child)
-                if found:
-                    return found
+                if found: return found
             return None
         lc = find(context.view_layer.layer_collection)
-        if lc:
-            context.view_layer.active_layer_collection = lc
+        if lc: context.view_layer.active_layer_collection = lc
 
     @staticmethod
     def _recenter_to_floor(context, objects):
-        if not objects:
-            return
+        if not objects: return
         context.view_layer.update()
         mn = [float('inf')] * 3
         mx = [float('-inf')] * 3
@@ -672,29 +1062,19 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
                 for i in range(3):
                     if wc[i] < mn[i]: mn[i] = wc[i]
                     if wc[i] > mx[i]: mx[i] = wc[i]
-        if mn[0] == float('inf'):
-            return
-        offset = mathutils.Vector((
-            -(mn[0] + mx[0]) / 2.0,
-            -(mn[1] + mx[1]) / 2.0,
-            -mn[2],
-        ))
+        if mn[0] == float('inf'): return
+        offset = mathutils.Vector(( -(mn[0] + mx[0]) / 2.0, -(mn[1] + mx[1]) / 2.0, -mn[2] ))
         shift = mathutils.Matrix.Translation(offset)
-        for obj in objects:
-            obj.matrix_world = shift @ obj.matrix_world
+        for obj in objects: obj.matrix_world = shift @ obj.matrix_world
 
     @staticmethod
     def _select_and_frame(context, objects):
-        for o in context.view_layer.objects:
-            o.select_set(False)
-        for obj in objects:
-            obj.select_set(True)
-        if objects:
-            context.view_layer.objects.active = objects[0]
+        for o in context.view_layer.objects: o.select_set(False)
+        for obj in objects: obj.select_set(True)
+        if objects: context.view_layer.objects.active = objects[0]
         for window in context.window_manager.windows:
             for area in window.screen.areas:
-                if area.type != 'VIEW_3D':
-                    continue
+                if area.type != 'VIEW_3D': continue
                 region = next((r for r in area.regions if r.type == 'WINDOW'), None)
                 if region:
                     with context.temp_override(window=window, area=area, region=region):
@@ -703,13 +1083,15 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
 
     def execute(self, context):
         size = context.scene.vox_settings.voxel_size
+        settings = context.scene.vox_settings
         try:
             scene = parse_vox_file(self.filepath)
-            context.scene.vox_settings.last_palette = str(scene.palette)
-            context.scene.vox_settings.last_import_dir = os.path.dirname(self.filepath)
+            settings.last_palette = str(scene.palette)
+            settings.last_materials = str(scene.materials)
+            settings.last_import_dir = os.path.dirname(self.filepath)
 
             coll_name = os.path.splitext(os.path.basename(self.filepath))[0] or "VoxImport"
-            context.scene.vox_settings.last_import_name = coll_name
+            settings.last_import_name = coll_name
             purge_previous_import(coll_name)
             vox_collection = bpy.data.collections.new(coll_name)
             context.scene.collection.children.link(vox_collection)
@@ -730,20 +1112,50 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
             self._recenter_to_floor(context, created)
             self._select_and_frame(context, created)
 
+            # --- POPULATE WYSIWYG MATERIAL LIST ---
+            used_colors = set()
+            for obj in created:
+                if "vox_color" in obj.data.attributes:
+                    for attr in obj.data.attributes["vox_color"].data:
+                        used_colors.add(attr.value)
+            
+            settings.materials_list.clear()
+            for c_idx in sorted(used_colors):
+                item = settings.materials_list.add()
+                item.color_idx = c_idx
+                pal_idx = max(0, min(255, c_idx - 1))
+                r, g, b, a = scene.palette[pal_idx]
+                item.preview_color = ((r/255.0)**2.2, (g/255.0)**2.2, (b/255.0)**2.2, 1.0)
+                
+                props = scene.materials.get(c_idx)
+                rough, metal = _vox_rough_metal(props)
+                trans, ior = _vox_transmission(props)
+                sss = _vox_subsurface(props)
+                _, _, _, flux, emissive = _vox_emission(props, (r,g,b))
+                
+                item.roughness = rough
+                item.metallic = metal
+                item.transmission = trans
+                item.ior = ior
+                item.sss = sss
+                item.emission = flux if emissive else 0.0
+            # ----------------------------------------
+
             report_str = f"Loaded objects: {len(scene.objects)}\n\n"
             report_str += "\n".join(report_lines)
             report_str += f"\n\nTotal: {total_raw} raw faces -> {total_opt} optimized faces."
             if total_raw > 0:
                 report_str += f"\nGeometry reduction: {100 - (total_opt/total_raw*100):.1f}%"
                 
-            context.scene.vox_settings.last_report = report_str
+            settings.last_report = report_str
             
-            if context.scene.vox_settings.show_optimization_report:
+            if settings.show_optimization_report:
                 bpy.ops.vox.show_report('INVOKE_DEFAULT')
             
             self.report({'INFO'}, f"Successfully imported {len(scene.objects)} meshes.")
         except Exception as e:
             self.report({'ERROR'}, f"Error: {str(e)}")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
     def invoke(self, context, event):
@@ -760,8 +1172,7 @@ class VOX_OT_BakeOperator(bpy.types.Operator):
     def _gather_targets(self, context):
         sel = [o for o in context.selected_objects
                if o.type == 'MESH' and "vox_color" in o.data.attributes]
-        if sel:
-            return sel
+        if sel: return sel
         coll = context.view_layer.active_layer_collection.collection
         if coll and coll != context.scene.collection:
             return [o for o in coll.all_objects
@@ -775,8 +1186,7 @@ class VOX_OT_BakeOperator(bpy.types.Operator):
             return {'CANCELLED'}
         if settings.save_in_vox_folder and settings.last_import_dir:
             return self.execute(context)
-        if bpy.data.filepath:
-            self.directory = os.path.dirname(bpy.data.filepath)
+        if bpy.data.filepath: self.directory = os.path.dirname(bpy.data.filepath)
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -787,23 +1197,36 @@ class VOX_OT_BakeOperator(bpy.types.Operator):
             self.report({'WARNING'}, "Select imported objects, or activate the collection imported by the add-on.")
             return {'CANCELLED'}
 
-        if settings.save_in_vox_folder and settings.last_import_dir:
-            out_dir = settings.last_import_dir
-        elif self.directory:
-            out_dir = self.directory
-        elif bpy.data.filepath:
-            out_dir = os.path.dirname(bpy.data.filepath)
-        else:
-            out_dir = bpy.app.tempdir or tempfile.gettempdir()
-        if not os.path.isdir(out_dir):
-            out_dir = bpy.app.tempdir or tempfile.gettempdir()
+        if settings.save_in_vox_folder and settings.last_import_dir: out_dir = settings.last_import_dir
+        elif self.directory: out_dir = self.directory
+        elif bpy.data.filepath: out_dir = os.path.dirname(bpy.data.filepath)
+        else: out_dir = bpy.app.tempdir or tempfile.gettempdir()
+        if not os.path.isdir(out_dir): out_dir = bpy.app.tempdir or tempfile.gettempdir()
 
         palette = eval(settings.last_palette) if settings.last_palette else build_default_palette()
-        res = int(settings.texture_resolution)
+        preserve_uvs = settings.preserve_manual_uvs
+        
+        try: mats = ast.literal_eval(settings.last_materials) if settings.last_materials else {}
+        except (ValueError, SyntaxError): mats = {}
+
+        if settings.use_shared_atlas:
+            atlas_objs = _shared_atlas_targets(context, targets)
+            atlas_name = (settings.last_import_name or "").strip()
+            if not atlas_name:
+                coll = context.view_layer.active_layer_collection.collection
+                if coll and coll != context.scene.collection:
+                    atlas_name = _base_part_name(coll.name)
+            atlas_name = atlas_name or "Character"
+            success, msg = bake_shared_atlas(atlas_objs, palette, settings, out_dir, atlas_name, materials=mats, preserve_uvs=preserve_uvs)
+            if not success:
+                self.report({'ERROR'}, msg)
+                return {'CANCELLED'}
+            self.report({'INFO'}, msg)
+            return {'FINISHED'}
 
         baked = 0
         for obj in targets:
-            success, msg = execute_bake(obj, palette, res, out_dir)
+            success, msg = execute_bake(obj, palette, settings, out_dir, preserve_uvs=preserve_uvs)
             if not success:
                 self.report({'ERROR'}, msg)
                 return {'CANCELLED'}
@@ -812,6 +1235,25 @@ class VOX_OT_BakeOperator(bpy.types.Operator):
         self.report({'INFO'}, f"Baked {baked} object(s) into {out_dir}")
         return {'FINISHED'}
 
+class VOX_OT_MergeAndCullOperator(bpy.types.Operator):
+    bl_idname = "vox.merge_cull"
+    bl_label = "Merge & Cull Internal Faces"
+    bl_description = "Unions selected parts into a single object and deletes hidden internal geometry"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context): return context.selected_objects and len(context.selected_objects) >= 2
+
+    def execute(self, context):
+        targets = [o for o in context.selected_objects if o.type == 'MESH' and "vox_color" in o.data.attributes]
+        success, msg = execute_boolean_culling(context, targets)
+        if success:
+            self.report({'INFO'}, msg)
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, msg)
+            return {'CANCELLED'}
+
 class VOX_OT_ExportFBXOperator(bpy.types.Operator):
     bl_idname = "vox.export_fbx"
     bl_label = "Export FBX"
@@ -819,98 +1261,78 @@ class VOX_OT_ExportFBXOperator(bpy.types.Operator):
 
     def _default_filepath(self, context):
         settings = context.scene.vox_settings
-
-        # Nome base: prioriza a Collection ativa (clicada no Outliner). No fluxo normal
-        # de importação ela tem o mesmo nome do modelo .vox importado.
         name = ""
         try:
             coll = context.view_layer.active_layer_collection.collection
-            if coll and coll != context.scene.collection:
-                name = _base_part_name(coll.name)
-        except Exception:
-            pass
-        if not name:
-            name = (getattr(settings, "last_import_name", "") or "").strip()
-        if not name and context.active_object:
-            name = _base_part_name(context.active_object.name)
-        if not name:
-            name = "export"
+            if coll and coll != context.scene.collection: name = _base_part_name(coll.name)
+        except Exception: pass
+        if not name: name = (getattr(settings, "last_import_name", "") or "").strip()
+        if not name and context.active_object: name = _base_part_name(context.active_object.name)
+        if not name: name = "export"
 
-        # Diretório padrão: pasta do .vox importado; senão, a pasta do .blend.
         out_dir = ""
-        if settings.last_import_dir and os.path.isdir(settings.last_import_dir):
-            out_dir = settings.last_import_dir
-        elif bpy.data.filepath:
-            out_dir = os.path.dirname(bpy.data.filepath)
+        if settings.last_import_dir and os.path.isdir(settings.last_import_dir): out_dir = settings.last_import_dir
+        elif bpy.data.filepath: out_dir = os.path.dirname(bpy.data.filepath)
 
         filename = name + ".fbx"
         return os.path.join(out_dir, filename) if out_dir else filename
 
     def execute(self, context):
-        # GARANTIA DO SUFIXO FBX
-        if not self.filepath.lower().endswith('.fbx'):
-            self.filepath += '.fbx'
+        if not self.filepath.lower().endswith('.fbx'): self.filepath += '.fbx'
+        fbx_kwargs = dict( filepath=self.filepath, use_selection=True, embed_textures=True, path_mode="COPY", mesh_smooth_type="FACE", )
 
-        fbx_kwargs = dict(
-            filepath=self.filepath,
-            use_selection=True,
-            embed_textures=True,
-            path_mode="COPY",
-            mesh_smooth_type="FACE",
-        )
-
-        if context.selected_objects:
-            # Comportamento padrão: exporta os objetos selecionados na Viewport.
-            bpy.ops.export_scene.fbx(**fbx_kwargs)
+        if context.selected_objects: bpy.ops.export_scene.fbx(**fbx_kwargs)
         else:
-            # Sem seleção: exporta os objetos da Collection ativa (clicada no Outliner),
-            # como se eles estivessem selecionados.
             coll = context.view_layer.active_layer_collection.collection
             targets = list(coll.all_objects) if (coll and coll != context.scene.collection) else []
             if not targets:
-                self.report({'WARNING'}, "Nenhum objeto para exportar. Selecione objetos na Viewport ou clique numa Collection no Outliner.")
+                self.report({'WARNING'}, "Nenhum objeto para exportar.")
                 return {'CANCELLED'}
 
             view_layer = context.view_layer
             prev_active = view_layer.objects.active
             selected_any = False
-            for o in view_layer.objects:
-                o.select_set(False)
+            for o in view_layer.objects: o.select_set(False)
             for o in targets:
                 try:
                     o.select_set(True)
                     view_layer.objects.active = o
                     selected_any = True
-                except RuntimeError:
-                    pass  # objeto oculto / fora da view layer
-            if not selected_any:
-                self.report({'WARNING'}, "Os objetos da Collection não puderam ser selecionados (ocultos?).")
-                return {'CANCELLED'}
-            try:
-                bpy.ops.export_scene.fbx(**fbx_kwargs)
+                except RuntimeError: pass
+            if not selected_any: return {'CANCELLED'}
+            try: bpy.ops.export_scene.fbx(**fbx_kwargs)
             finally:
-                # Restaura o estado anterior (nada selecionado, como após clicar na Collection).
-                for o in view_layer.objects:
-                    o.select_set(False)
+                for o in view_layer.objects: o.select_set(False)
                 view_layer.objects.active = prev_active
 
-        self.report({'INFO'}, "FBX exported successfully for the engine.")
+        self.report({'INFO'}, "FBX exported successfully.")
         return {'FINISHED'}
         
     def invoke(self, context, event):
-        # VALIDAÇÃO: aceita objetos selecionados OU uma Collection ativa (clicada no Outliner)
         if not context.selected_objects:
             coll = context.view_layer.active_layer_collection.collection
             has_coll_objs = bool(coll and coll != context.scene.collection and len(coll.all_objects) > 0)
-            if not has_coll_objs:
-                self.report({'WARNING'}, "Nenhum objeto selecionado nem Collection ativa com objetos. Selecione objetos na Viewport ou clique numa Collection no Outliner.")
-                return {'CANCELLED'}
+            if not has_coll_objs: return {'CANCELLED'}
 
         self.filepath = self._default_filepath(context)
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
 class VoxelSettings(bpy.types.PropertyGroup):
+    upscale_mode: bpy.props.EnumProperty(
+        name="Texture Mode",
+        items=[
+            ('POT', "Standard POT (1024, 2048)", "Stretches to fixed resolution"),
+            ('PIXEL', "Pixel-Perfect Upscale", "Generates minimal texture and multiplies by scale factor")
+        ],
+        default='PIXEL'
+    )
+    pixel_scale_factor: bpy.props.IntProperty(
+        name="Upscale Multiplier",
+        description="Multiplier for the minimal pixel grid (e.g. 16 means each color is a 16x16 block)",
+        default=16,
+        min=1, max=256
+    )
     texture_resolution: bpy.props.EnumProperty(
         name="Texture Resolution",
         description="Industry-standard POT (power of two) sizes",
@@ -925,8 +1347,24 @@ class VoxelSettings(bpy.types.PropertyGroup):
     )
     voxel_size: bpy.props.FloatProperty(name="Voxel Size", default=1.0, precision=2) 
     save_in_vox_folder: bpy.props.BoolProperty(name="Save in imported .vox folder", default=True)
+    use_shared_atlas: bpy.props.BoolProperty(
+        name="Shared atlas (one texture)",
+        description="Bake every part onto a single shared texture and material.",
+        default=True,
+    )
+    preserve_manual_uvs: bpy.props.BoolProperty(
+        name="Preserve Manual UVs",
+        description="If checked, re-baking will update the texture files but won't overwrite manual UV edits.",
+        default=False,
+    )
     show_optimization_report: bpy.props.BoolProperty(name="Show Optimization Report", default=True)
+    
+    # WYSIWYG Materials Variables
+    materials_list: bpy.props.CollectionProperty(type=VoxMaterialItem)
+    active_material_idx: bpy.props.IntProperty()
+    
     last_palette: bpy.props.StringProperty()
+    last_materials: bpy.props.StringProperty()
     last_import_dir: bpy.props.StringProperty()
     last_import_name: bpy.props.StringProperty()
     last_report: bpy.props.StringProperty()
@@ -946,22 +1384,54 @@ class VIEW3D_PT_VoxelPipelinePanel(bpy.types.Panel):
         layout.operator("vox.import", text="Import and Optimize .Vox")
         layout.separator()
 
-        layout.label(text="Bake", icon='TEXTURE')
+        layout.label(text="Bake & Upscaling", icon='TEXTURE')
         box = layout.box()
-        box.prop(settings, "texture_resolution")
+        box.prop(settings, "upscale_mode")
+        if settings.upscale_mode == 'POT':
+            box.prop(settings, "texture_resolution")
+        else:
+            box.prop(settings, "pixel_scale_factor")
+            
         box.prop(settings, "voxel_size")
+        box.prop(settings, "use_shared_atlas")
+        box.prop(settings, "preserve_manual_uvs")
         box.prop(settings, "save_in_vox_folder")
-        layout.operator("vox.bake", text="Bake")
+        
+        layout.separator()
+        
+        layout.label(text="WYSIWYG Material Editor", icon='MATERIAL')
+        row = layout.row()
+        row.template_list("VOX_UL_MaterialList", "", settings, "materials_list", settings, "active_material_idx", rows=4)
+        
+        if len(settings.materials_list) > 0 and settings.active_material_idx < len(settings.materials_list):
+            active_mat = settings.materials_list[settings.active_material_idx]
+            mbox = layout.box()
+            mbox.prop(active_mat, "roughness")
+            mbox.prop(active_mat, "metallic")
+            mbox.prop(active_mat, "emission")
+            mbox.prop(active_mat, "transmission")
+            mbox.prop(active_mat, "ior")
+            mbox.prop(active_mat, "sss")
+
+        layout.separator()
+        layout.operator("vox.bake", text="Bake Maps")
+        layout.separator()
+
+        layout.label(text="Advanced Clean", icon='MODIFIER')
+        layout.operator("vox.merge_cull", text="Merge & Cull Hidden Faces", icon='AUTOMERGE_ON')
         layout.separator()
 
         layout.label(text="Export", icon='EXPORT')
         layout.operator("vox.export_fbx", text="Export FBX")
 
 classes = (
+    VoxMaterialItem,
     VoxelSettings, 
+    VOX_UL_MaterialList,
     VOX_OT_ShowReport, 
     VOX_OT_ImportOperator, 
-    VOX_OT_BakeOperator, 
+    VOX_OT_BakeOperator,
+    VOX_OT_MergeAndCullOperator,
     VOX_OT_ExportFBXOperator, 
     VIEW3D_PT_VoxelPipelinePanel
 )
